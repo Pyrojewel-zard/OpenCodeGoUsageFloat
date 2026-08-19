@@ -2,13 +2,21 @@
 
 一个原生 Windows 轻量浮窗，用于查看 OpenCode Go 的 5 小时 / 每周 / 每月额度。
 
-## 功能
+## v1.2.0
+
+- 深色 / 白色模式切换
+- 透明度可调：100% / 85% / 70% / 55%
+- Pin 锁定模式：锁定后主浮窗启用 Windows 级鼠标穿透，鼠标事件会落到后面的应用
+- 锁定时仅右上角独立“解锁”小按钮可点击，其余区域不能拖动、不能误触
+- 保留托盘图标、置顶、自动刷新、DPAPI 加密保存 Key 等功能
+
+## 基础功能
 
 - 输入 `sk-opencode-...` 后直接查询 OpenCode Go 用量
 - 5h / Week / Month 三个额度进度条
 - 自动显示重置倒计时
 - 每 30 秒自动刷新；失败时保留上一次成功数据并提示“数据未更新”
-- Windows 托盘：显示/隐藏、立即刷新、修改 API Key、始终置顶、退出
+- Windows 托盘：显示/隐藏、立即刷新、修改 API Key、主题、透明度、Pin、始终置顶、退出
 - 无 Electron / Node / WebView 依赖
 - API Key 使用当前 Windows 用户的 DPAPI 加密，仅保存到本机 `%APPDATA%\OpenCodeGoUsage\key.dat`
 
@@ -38,20 +46,33 @@ Accept: application/json
 
 ## 构建
 
-需要 Go 1.23+。在 Windows / Linux / macOS 均可交叉编译 Windows x64 单文件：
+由于 ChatGPT GitHub 连接器对超长文件有限制，仓库中的 `main.go` 被无损拆成：
 
-```bash
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-H windowsgui -s -w" -o OpenCodeGoUsage.exe .
+```text
+src/main.go.part00
+src/main.go.part01
+src/main.go.part02
+src/main.go.part03
+src/main.go.part04
 ```
 
-PowerShell：
+Windows 下直接运行：
 
 ```powershell
-$env:GOOS="windows"
-$env:GOARCH="amd64"
-$env:CGO_ENABLED="0"
-go build -trimpath -ldflags="-H windowsgui -s -w" -o OpenCodeGoUsage.exe .
+.\build.ps1
 ```
+
+脚本会自动合并为 `main.go`、执行 `go vet`，并编译：
+
+```text
+OpenCodeGoUsage.exe
+```
+
+GitHub Actions 也会在每次 push 后自动构建 Windows x64 EXE，可在对应 Actions run 的 Artifacts 中下载。
+
+## Pin 实现
+
+Pin 并不是简单“禁用窗口”。锁定时主浮窗会加入 `WS_EX_TRANSPARENT`，因此鼠标操作直接穿透到后面的 Cadence、浏览器、终端等窗口；同时单独创建一个置顶的小型解锁窗口，因此仍然保留唯一可点击的解锁入口。
 
 ## 致谢 / 来源
 
@@ -59,11 +80,4 @@ go build -trimpath -ldflags="-H windowsgui -s -w" -o OpenCodeGoUsage.exe .
 
 - `https://github.com/yascitom/dsh-opencode-go-box`
 
-原项目采用 MIT License。见 `THIRD_PARTY_LICENSE.txt`。
-
-## v1.1.0 图标更新
-
-- 内置专属 OpenCode Go Usage 图标。
-- 图标包含 16/20/24/32/40/48/64/128/256 px 多尺寸。
-- 图标通过 Go `embed` 打包进 EXE，运行时无需外部 PNG/ICO。
-- Windows 托盘图标与窗口图标统一使用内置图标。
+原项目采用 MIT License。
