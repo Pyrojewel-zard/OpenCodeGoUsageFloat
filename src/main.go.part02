@@ -1,3 +1,18 @@
+	dec, err := unprotect(raw[9 : 9+n])
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(dec))
+}
+
+func getText(hwnd uintptr) string {
+	n, _, _ := procGetWindowTextLengthW.Call(hwnd)
+	if n == 0 {
+		return ""
+	}
+	buf := make([]uint16, n+1)
+	procGetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), n+1)
+	return syscall.UTF16ToString(buf)
 }
 
 func setText(hwnd uintptr, s string) {
@@ -149,12 +164,12 @@ func drawText(hdc uintptr, text string, r rect, font uintptr, color uintptr, fla
 	procSelectObject.Call(hdc, old)
 }
 
-func drawQuota(hdc uintptr, y int32, label string, w *quotaWindow) {
+func drawQuota(hdc uintptr, y int32, label string, w *quotaWindow, textColor, subtle, barBg uintptr) {
 	p := percent(w)
-	drawText(hdc, label, rect{16, y, 90, y + 20}, fontNormal, rgb(220, 224, 230), DT_LEFT|DT_VCENTER|DT_SINGLELINE)
-	drawText(hdc, fmt.Sprintf("%.0f%%", p), rect{265, y, 326, y + 20}, fontNormal, rgb(235, 238, 243), DT_RIGHT|DT_VCENTER|DT_SINGLELINE)
+	drawText(hdc, label, rect{16, y, 90, y + 20}, fontNormal, textColor, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	drawText(hdc, fmt.Sprintf("%.0f%%", p), rect{265, y, 326, y + 20}, fontNormal, textColor, DT_RIGHT|DT_VCENTER|DT_SINGLELINE)
 	bg := rect{84, y + 6, 256, y + 14}
-	fill(hdc, bg, rgb(54, 59, 68))
+	fill(hdc, bg, barBg)
 	barW := int32(float64(172) * p / 100.0)
 	if barW > 0 {
 		fill(hdc, rect{84, y + 6, 84 + barW, y + 14}, colorFor(p))
@@ -163,7 +178,7 @@ func drawQuota(hdc uintptr, y int32, label string, w *quotaWindow) {
 	if w != nil {
 		reset = countdown(parseReset(w.ResetsAt))
 	}
-	drawText(hdc, reset, rect{190, y + 20, 326, y + 36}, fontSmall, rgb(132, 140, 152), DT_RIGHT|DT_VCENTER|DT_SINGLELINE)
+	drawText(hdc, reset, rect{190, y + 20, 326, y + 36}, fontSmall, subtle, DT_RIGHT|DT_VCENTER|DT_SINGLELINE)
 }
 
 func paint(hwnd uintptr) {
@@ -175,8 +190,6 @@ func paint(hwnd uintptr) {
 	defer procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 	var rc rect
 	procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
-	fill(hdc, rc, rgb(31, 34, 40))
-
 	state.mu.RLock()
 	stKey := state.key
 	stSetup := state.setup
@@ -185,3 +198,73 @@ func paint(hwnd uintptr) {
 	stErrText := state.errText
 	stUsage := state.usage
 	stFetchedAt := state.fetchedAt
+	light := state.lightMode
+	locked := state.locked
+	state.mu.RUnlock()
+
+	bg := rgb(31, 34, 40)
+	titleColor := rgb(243, 245, 248)
+	textColor := rgb(220, 224, 230)
+	subtle := rgb(132, 140, 152)
+	faint := rgb(105, 112, 124)
+	barBg := rgb(54, 59, 68)
+	if light {
+		bg = rgb(248, 249, 251)
+		titleColor = rgb(35, 39, 47)
+		textColor = rgb(61, 67, 78)
+		subtle = rgb(103, 111, 124)
+		faint = rgb(130, 137, 149)
+		barBg = rgb(221, 225, 231)
+	}
+	fill(hdc, rc, bg)
+
+	drawText(hdc, "OpenCode Go", rect{16, 10, 220, 38}, fontTitle, titleColor, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	status := "● 已连接"
+	statusColor := rgb(83, 201, 126)
+	if stLoading {
+		status = "● 刷新中"
+		statusColor = rgb(92, 164, 245)
+	}
+	if stErrText != "" {
+		status = "● " + stErrText
+		statusColor = rgb(242, 92, 92)
+	}
+	drawText(hdc, status, rect{190, 12, 326, 34}, fontSmall, statusColor, DT_RIGHT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+
+	pr := pinRect()
+	if locked {
+		fill(hdc, pr, rgb(76, 132, 247))
+		drawText(hdc, "🔒", pr, fontNormal, rgb(255, 255, 255), DT_VCENTER|DT_SINGLELINE|DT_RIGHT)
+	} else {
+		fill(hdc, pr, barBg)
+		drawText(hdc, "PIN", pr, fontSmall, subtle, DT_VCENTER|DT_SINGLELINE|DT_RIGHT)
+	}
+
+	if stSetup || stKey == "" {
+		drawText(hdc, "输入 OpenCode Go API Key", rect{16, 49, 326, 72}, fontNormal, rgb(218, 222, 228), DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+		drawText(hdc, "密钥仅使用 Windows DPAPI 加密后保存在本机。", rect{16, 121, 326, 145}, fontSmall, subtle, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+		drawText(hdc, "接口：opencode.ai/zen/go/v1/usage", rect{16, 147, 326, 169}, fontSmall, faint, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+		return
+	}
+
+	drawQuota(hdc, 47, "5h", stUsage.Rolling, textColor, subtle, barBg)
+	drawQuota(hdc, 88, "Week", stUsage.Weekly, textColor, subtle, barBg)
+	drawQuota(hdc, 129, "Month", stUsage.Monthly, textColor, subtle, barBg)
+	footer := "尚未成功获取用量"
+	if !stFetchedAt.IsZero() {
+		footer = "更新 " + stFetchedAt.Format("15:04:05")
+	}
+	if stStale {
+		footer += " · 数据未更新"
+	}
+	drawText(hdc, footer, rect{16, 176, 326, 198}, fontSmall, subtle, DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+}
+
+func updateSetupControls() {
+	state.mu.RLock()
+	setup := state.setup || state.key == ""
+	key := state.key
+	state.mu.RUnlock()
+	if setup {
+		procShowWindow.Call(hwndEdit, SW_SHOW)
+		procShowWindow.Call(hwndSave, SW_SHOW)
