@@ -1,46 +1,3 @@
-	state.mu.RUnlock()
-
-	drawText(hdc, "OpenCode Go", rect{16, 10, 220, 38}, fontTitle, rgb(243, 245, 248), DT_LEFT|DT_VCENTER|DT_SINGLELINE)
-	status := "● 已连接"
-	statusColor := rgb(83, 201, 126)
-	if stLoading {
-		status = "● 刷新中"
-		statusColor = rgb(92, 164, 245)
-	}
-	if stErrText != "" {
-		status = "● " + stErrText
-		statusColor = rgb(242, 92, 92)
-	}
-	drawText(hdc, status, rect{190, 12, 326, 34}, fontSmall, statusColor, DT_RIGHT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
-
-	if stSetup || stKey == "" {
-		drawText(hdc, "输入 OpenCode Go API Key", rect{16, 49, 326, 72}, fontNormal, rgb(218, 222, 228), DT_LEFT|DT_VCENTER|DT_SINGLELINE)
-		drawText(hdc, "密钥仅使用 Windows DPAPI 加密后保存在本机。", rect{16, 121, 326, 145}, fontSmall, rgb(132, 140, 152), DT_LEFT|DT_VCENTER|DT_SINGLELINE)
-		drawText(hdc, "接口：opencode.ai/zen/go/v1/usage", rect{16, 147, 326, 169}, fontSmall, rgb(105, 112, 124), DT_LEFT|DT_VCENTER|DT_SINGLELINE)
-		return
-	}
-
-	drawQuota(hdc, 47, "5h", stUsage.Rolling)
-	drawQuota(hdc, 88, "Week", stUsage.Weekly)
-	drawQuota(hdc, 129, "Month", stUsage.Monthly)
-	footer := "尚未成功获取用量"
-	if !stFetchedAt.IsZero() {
-		footer = "更新 " + stFetchedAt.Format("15:04:05")
-	}
-	if stStale {
-		footer += " · 数据未更新"
-	}
-	drawText(hdc, footer, rect{16, 176, 326, 198}, fontSmall, rgb(112, 120, 132), DT_LEFT|DT_VCENTER|DT_SINGLELINE)
-}
-
-func updateSetupControls() {
-	state.mu.RLock()
-	setup := state.setup || state.key == ""
-	key := state.key
-	state.mu.RUnlock()
-	if setup {
-		procShowWindow.Call(hwndEdit, SW_SHOW)
-		procShowWindow.Call(hwndSave, SW_SHOW)
 		if getText(hwndEdit) == "" && key != "" {
 			setText(hwndEdit, key)
 		}
@@ -59,6 +16,9 @@ func setTopmost(on bool) {
 		target = HWND_TOPMOST
 	}
 	procSetWindowPos.Call(hwndMain, target, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE)
+	if hwndPin != 0 {
+		procSetWindowPos.Call(hwndPin, target, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE)
+	}
 	state.mu.Lock()
 	state.topmost = on
 	state.mu.Unlock()
@@ -73,6 +33,9 @@ func showTrayMenu() {
 	state.mu.RLock()
 	top := state.topmost
 	visible := state.visible
+	light := state.lightMode
+	locked := state.locked
+	opacity := state.opacity
 	state.mu.RUnlock()
 	appendMenu := func(flags uintptr, id uintptr, text string) {
 		procAppendMenuW.Call(menu, flags, id, uintptr(unsafe.Pointer(utf16Ptr(text))))
@@ -84,6 +47,21 @@ func showTrayMenu() {
 	}
 	appendMenu(MF_STRING, menuRefresh, "立即刷新")
 	appendMenu(MF_STRING, menuSetup, "修改 API Key")
+	themeFlag := uintptr(MF_STRING | MF_UNCHECKED)
+	if light {
+		themeFlag = MF_STRING | MF_CHECKED
+	}
+	appendMenu(themeFlag, menuTheme, "白色模式")
+	pinFlag := uintptr(MF_STRING | MF_UNCHECKED)
+	if locked {
+		pinFlag = MF_STRING | MF_CHECKED
+	}
+	appendMenu(pinFlag, menuPin, "Pin 锁定 / 鼠标穿透")
+	appendMenu(MF_SEPARATOR, 0, "")
+	appendMenu(MF_STRING|map[bool]uintptr{true: MF_CHECKED, false: MF_UNCHECKED}[opacity == 255], menuOpacity100, "透明度 100%")
+	appendMenu(MF_STRING|map[bool]uintptr{true: MF_CHECKED, false: MF_UNCHECKED}[opacity == 217], menuOpacity85, "透明度 85%")
+	appendMenu(MF_STRING|map[bool]uintptr{true: MF_CHECKED, false: MF_UNCHECKED}[opacity == 179], menuOpacity70, "透明度 70%")
+	appendMenu(MF_STRING|map[bool]uintptr{true: MF_CHECKED, false: MF_UNCHECKED}[opacity == 140], menuOpacity55, "透明度 55%")
 	topFlag := uintptr(MF_STRING | MF_UNCHECKED)
 	if top {
 		topFlag = MF_STRING | MF_CHECKED
@@ -181,7 +159,120 @@ func wndProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	case WM_NCHITTEST:
 		state.mu.RLock()
 		setup := state.setup || state.key == ""
+		locked := state.locked
 		state.mu.RUnlock()
+		pt := clientCursor()
+		if pointInRect(pt, pinRect()) {
+			return HTCLIENT
+		}
+		if locked {
+			return HTTRANSPARENT
+		}
 		if setup {
 			return HTCLIENT
 		}
+		return HTCAPTION
+	case WM_LBUTTONDOWN:
+		pt := point{X: int32(int16(loWord(lParam))), Y: int32(int16(loWord(lParam >> 16)))}
+		if pointInRect(pt, pinRect()) {
+			state.mu.RLock()
+			next := !state.locked
+			state.mu.RUnlock()
+			setLocked(next)
+			return 0
+		}
+	case WM_TIMER:
+		if wParam == 1 {
+			procInvalidateRect.Call(hwnd, 0, 0)
+		}
+		if wParam == 2 {
+			go fetchUsage()
+		}
+		return 0
+	case WM_DATAREADY:
+		procInvalidateRect.Call(hwnd, 0, 1)
+		return 0
+	case WM_SHOWSETUP:
+		state.mu.Lock()
+		state.setup = true
+		state.mu.Unlock()
+		updateSetupControls()
+		return 0
+	case WM_COMMAND:
+		id := int(loWord(wParam))
+		switch id {
+		case idUnlock:
+			setLocked(false)
+			return 0
+		case idSaveKey:
+			k := strings.TrimSpace(getText(hwndEdit))
+			if k == "" {
+				return 0
+			}
+			if err := saveKey(k); err != nil {
+				state.mu.Lock()
+				state.errText = "保存 Key 失败"
+				state.mu.Unlock()
+				procInvalidateRect.Call(hwnd, 0, 1)
+				return 0
+			}
+			state.mu.Lock()
+			state.key = k
+			state.setup = false
+			state.errText = ""
+			state.mu.Unlock()
+			updateSetupControls()
+			go fetchUsage()
+			return 0
+		case menuRefresh:
+			go fetchUsage()
+			return 0
+		case menuSetup:
+			procPostMessageW.Call(hwnd, WM_SHOWSETUP, 0, 0)
+			return 0
+		case menuTopmost:
+			state.mu.RLock()
+			on := !state.topmost
+			state.mu.RUnlock()
+			setTopmost(on)
+			return 0
+		case menuTheme:
+			state.mu.Lock()
+			state.lightMode = !state.lightMode
+			state.mu.Unlock()
+			procInvalidateRect.Call(hwnd, 0, 1)
+			return 0
+		case menuPin:
+			state.mu.RLock()
+			next := !state.locked
+			state.mu.RUnlock()
+			setLocked(next)
+			return 0
+		case menuOpacity100:
+			setOpacity(255)
+			return 0
+		case menuOpacity85:
+			setOpacity(217)
+			return 0
+		case menuOpacity70:
+			setOpacity(179)
+			return 0
+		case menuOpacity55:
+			setOpacity(140)
+			return 0
+		case menuShow:
+			state.mu.Lock()
+			state.visible = !state.visible
+			visible := state.visible
+			state.mu.Unlock()
+			if visible {
+				procShowWindow.Call(hwnd, SW_SHOW)
+				state.mu.RLock()
+				lk := state.locked
+				state.mu.RUnlock()
+				if lk {
+					positionPinWindow()
+					procShowWindow.Call(hwndPin, SW_SHOW)
+				}
+			} else {
+				procShowWindow.Call(hwnd, SW_HIDE)
