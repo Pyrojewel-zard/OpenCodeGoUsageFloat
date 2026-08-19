@@ -1,0 +1,187 @@
+}
+
+func setText(hwnd uintptr, s string) {
+	procSetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(utf16Ptr(s))))
+}
+
+func fetchUsage() {
+	if !fetching.CompareAndSwap(false, true) {
+		return
+	}
+	defer fetching.Store(false)
+	state.mu.RLock()
+	key := state.key
+	state.mu.RUnlock()
+	if key == "" {
+		return
+	}
+	state.mu.Lock()
+	state.loading = true
+	state.mu.Unlock()
+	procPostMessageW.Call(hwndMain, WM_DATAREADY, 0, 0)
+
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	if err == nil {
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "OpenCodeGoUsageFloat/1.0")
+	}
+	var payload usagePayload
+	var errText string
+	if err == nil {
+		resp, e := httpClient.Do(req)
+		if e != nil {
+			err = e
+		} else {
+			defer resp.Body.Close()
+			body, e2 := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			if e2 != nil {
+				err = e2
+			} else if resp.StatusCode != http.StatusOK {
+				if resp.StatusCode == http.StatusUnauthorized {
+					errText = "Key 无效（401）"
+				} else {
+					errText = fmt.Sprintf("服务返回 HTTP %d", resp.StatusCode)
+				}
+			} else {
+				var env apiEnvelope
+				if e3 := json.Unmarshal(body, &env); e3 != nil {
+					err = e3
+				} else if env.Usage != nil {
+					payload = *env.Usage
+				} else {
+					payload = usagePayload{Rolling: env.Rolling, Weekly: env.Weekly, Monthly: env.Monthly}
+				}
+				if payload.Rolling == nil && payload.Weekly == nil && payload.Monthly == nil {
+					errText = "接口格式已变化"
+				}
+			}
+		}
+	}
+	if err != nil {
+		errText = "网络请求失败"
+	}
+
+	state.mu.Lock()
+	state.loading = false
+	if errText == "" {
+		state.usage = payload
+		state.fetchedAt = time.Now()
+		state.stale = false
+		state.errText = ""
+	} else {
+		state.stale = !state.fetchedAt.IsZero()
+		state.errText = errText
+	}
+	state.mu.Unlock()
+	procPostMessageW.Call(hwndMain, WM_DATAREADY, 0, 0)
+}
+
+func percent(w *quotaWindow) float64 {
+	if w == nil {
+		return 0
+	}
+	if w.Percent < 0 {
+		return 0
+	}
+	if w.Percent > 100 {
+		return 100
+	}
+	return w.Percent
+}
+
+func parseReset(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err == nil {
+		return t
+	}
+	t, _ = time.Parse("2006-01-02T15:04:05.999999999Z07:00", s)
+	return t
+}
+
+func countdown(t time.Time) string {
+	if t.IsZero() {
+		return "—"
+	}
+	d := time.Until(t)
+	if d <= 0 {
+		return "即将重置"
+	}
+	days := int(d / (24 * time.Hour))
+	d %= 24 * time.Hour
+	h := int(d / time.Hour)
+	d %= time.Hour
+	m := int(d / time.Minute)
+	if days > 0 {
+		return fmt.Sprintf("%dd %dh", days, h)
+	}
+	if h > 0 {
+		return fmt.Sprintf("%dh %02dm", h, m)
+	}
+	return fmt.Sprintf("%dm", m)
+}
+
+func colorFor(p float64) uintptr {
+	if p >= 85 {
+		return rgb(242, 92, 92)
+	}
+	if p >= 60 {
+		return rgb(244, 166, 70)
+	}
+	return rgb(83, 201, 126)
+}
+
+func fill(hdc uintptr, r rect, color uintptr) {
+	b, _, _ := procCreateSolidBrush.Call(color)
+	procFillRect.Call(hdc, uintptr(unsafe.Pointer(&r)), b)
+	procDeleteObject.Call(b)
+}
+
+func drawText(hdc uintptr, text string, r rect, font uintptr, color uintptr, flags uint32) {
+	old, _, _ := procSelectObject.Call(hdc, font)
+	procSetBkMode.Call(hdc, TRANSPARENT)
+	procSetTextColor.Call(hdc, color)
+	p := utf16Ptr(text)
+	procDrawTextW.Call(hdc, uintptr(unsafe.Pointer(p)), ^uintptr(0), uintptr(unsafe.Pointer(&r)), uintptr(flags))
+	procSelectObject.Call(hdc, old)
+}
+
+func drawQuota(hdc uintptr, y int32, label string, w *quotaWindow) {
+	p := percent(w)
+	drawText(hdc, label, rect{16, y, 90, y + 20}, fontNormal, rgb(220, 224, 230), DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	drawText(hdc, fmt.Sprintf("%.0f%%", p), rect{265, y, 326, y + 20}, fontNormal, rgb(235, 238, 243), DT_RIGHT|DT_VCENTER|DT_SINGLELINE)
+	bg := rect{84, y + 6, 256, y + 14}
+	fill(hdc, bg, rgb(54, 59, 68))
+	barW := int32(float64(172) * p / 100.0)
+	if barW > 0 {
+		fill(hdc, rect{84, y + 6, 84 + barW, y + 14}, colorFor(p))
+	}
+	reset := "—"
+	if w != nil {
+		reset = countdown(parseReset(w.ResetsAt))
+	}
+	drawText(hdc, reset, rect{190, y + 20, 326, y + 36}, fontSmall, rgb(132, 140, 152), DT_RIGHT|DT_VCENTER|DT_SINGLELINE)
+}
+
+func paint(hwnd uintptr) {
+	var ps paintStruct
+	hdc, _, _ := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+	if hdc == 0 {
+		return
+	}
+	defer procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+	var rc rect
+	procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
+	fill(hdc, rc, rgb(31, 34, 40))
+
+	state.mu.RLock()
+	stKey := state.key
+	stSetup := state.setup
+	stLoading := state.loading
+	stStale := state.stale
+	stErrText := state.errText
+	stUsage := state.usage
+	stFetchedAt := state.fetchedAt
