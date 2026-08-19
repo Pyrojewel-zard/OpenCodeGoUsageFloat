@@ -1,0 +1,187 @@
+	state.mu.RUnlock()
+
+	drawText(hdc, "OpenCode Go", rect{16, 10, 220, 38}, fontTitle, rgb(243, 245, 248), DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+	status := "● 已连接"
+	statusColor := rgb(83, 201, 126)
+	if stLoading {
+		status = "● 刷新中"
+		statusColor = rgb(92, 164, 245)
+	}
+	if stErrText != "" {
+		status = "● " + stErrText
+		statusColor = rgb(242, 92, 92)
+	}
+	drawText(hdc, status, rect{190, 12, 326, 34}, fontSmall, statusColor, DT_RIGHT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+
+	if stSetup || stKey == "" {
+		drawText(hdc, "输入 OpenCode Go API Key", rect{16, 49, 326, 72}, fontNormal, rgb(218, 222, 228), DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+		drawText(hdc, "密钥仅使用 Windows DPAPI 加密后保存在本机。", rect{16, 121, 326, 145}, fontSmall, rgb(132, 140, 152), DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+		drawText(hdc, "接口：opencode.ai/zen/go/v1/usage", rect{16, 147, 326, 169}, fontSmall, rgb(105, 112, 124), DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+		return
+	}
+
+	drawQuota(hdc, 47, "5h", stUsage.Rolling)
+	drawQuota(hdc, 88, "Week", stUsage.Weekly)
+	drawQuota(hdc, 129, "Month", stUsage.Monthly)
+	footer := "尚未成功获取用量"
+	if !stFetchedAt.IsZero() {
+		footer = "更新 " + stFetchedAt.Format("15:04:05")
+	}
+	if stStale {
+		footer += " · 数据未更新"
+	}
+	drawText(hdc, footer, rect{16, 176, 326, 198}, fontSmall, rgb(112, 120, 132), DT_LEFT|DT_VCENTER|DT_SINGLELINE)
+}
+
+func updateSetupControls() {
+	state.mu.RLock()
+	setup := state.setup || state.key == ""
+	key := state.key
+	state.mu.RUnlock()
+	if setup {
+		procShowWindow.Call(hwndEdit, SW_SHOW)
+		procShowWindow.Call(hwndSave, SW_SHOW)
+		if getText(hwndEdit) == "" && key != "" {
+			setText(hwndEdit, key)
+		}
+		procSetFocus.Call(hwndEdit)
+	} else {
+		procShowWindow.Call(hwndEdit, SW_HIDE)
+		procShowWindow.Call(hwndSave, SW_HIDE)
+		setText(hwndEdit, "")
+	}
+	procInvalidateRect.Call(hwndMain, 0, 1)
+}
+
+func setTopmost(on bool) {
+	target := HWND_NOTOPMOST
+	if on {
+		target = HWND_TOPMOST
+	}
+	procSetWindowPos.Call(hwndMain, target, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE)
+	state.mu.Lock()
+	state.topmost = on
+	state.mu.Unlock()
+}
+
+func showTrayMenu() {
+	menu, _, _ := procCreatePopupMenu.Call()
+	if menu == 0 {
+		return
+	}
+	defer procDestroyMenu.Call(menu)
+	state.mu.RLock()
+	top := state.topmost
+	visible := state.visible
+	state.mu.RUnlock()
+	appendMenu := func(flags uintptr, id uintptr, text string) {
+		procAppendMenuW.Call(menu, flags, id, uintptr(unsafe.Pointer(utf16Ptr(text))))
+	}
+	if visible {
+		appendMenu(MF_STRING, menuShow, "隐藏浮窗")
+	} else {
+		appendMenu(MF_STRING, menuShow, "显示浮窗")
+	}
+	appendMenu(MF_STRING, menuRefresh, "立即刷新")
+	appendMenu(MF_STRING, menuSetup, "修改 API Key")
+	topFlag := uintptr(MF_STRING | MF_UNCHECKED)
+	if top {
+		topFlag = MF_STRING | MF_CHECKED
+	}
+	appendMenu(topFlag, menuTopmost, "始终置顶")
+	appendMenu(MF_SEPARATOR, 0, "")
+	appendMenu(MF_STRING, menuExit, "退出")
+	var pt point
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	procSetForegroundWindow.Call(hwndMain)
+	cmd, _, _ := procTrackPopupMenu.Call(menu, TPM_RIGHTBUTTON|TPM_RETURNCMD, uintptr(pt.X), uintptr(pt.Y), 0, hwndMain, 0)
+	if cmd != 0 {
+		procPostMessageW.Call(hwndMain, WM_COMMAND, cmd, 0)
+	}
+}
+
+func loadEmbeddedIcon(desired int) uintptr {
+	// ICO header: ICONDIR (6 bytes), followed by 16-byte ICONDIRENTRY records.
+	// CreateIconFromResourceEx accepts the raw image payload from one entry.
+	if len(appIconICO) < 6 || binary.LittleEndian.Uint16(appIconICO[0:2]) != 0 || binary.LittleEndian.Uint16(appIconICO[2:4]) != 1 {
+		return 0
+	}
+	count := int(binary.LittleEndian.Uint16(appIconICO[4:6]))
+	bestOffset, bestSize, bestDelta := 0, 0, int(^uint(0)>>1)
+	for i := 0; i < count; i++ {
+		base := 6 + i*16
+		if base+16 > len(appIconICO) {
+			break
+		}
+		w := int(appIconICO[base])
+		if w == 0 {
+			w = 256
+		}
+		h := int(appIconICO[base+1])
+		if h == 0 {
+			h = 256
+		}
+		sz := int(binary.LittleEndian.Uint32(appIconICO[base+8 : base+12]))
+		off := int(binary.LittleEndian.Uint32(appIconICO[base+12 : base+16]))
+		if sz <= 0 || off < 0 || off+sz > len(appIconICO) {
+			continue
+		}
+		delta := w - desired
+		if delta < 0 {
+			delta = -delta
+		}
+		if hdelta := h - desired; hdelta < 0 {
+			delta += -hdelta
+		} else {
+			delta += hdelta
+		}
+		if delta < bestDelta {
+			bestDelta, bestOffset, bestSize = delta, off, sz
+		}
+	}
+	if bestSize == 0 {
+		return 0
+	}
+	h, _, _ := procCreateIconFromResourceEx.Call(
+		uintptr(unsafe.Pointer(&appIconICO[bestOffset])), uintptr(bestSize), 1, 0x00030000,
+		uintptr(desired), uintptr(desired), 0,
+	)
+	return h
+}
+
+func addTrayIcon() {
+	icon := hIconSmall
+	if icon == 0 {
+		icon, _, _ = procLoadIconW.Call(0, IDI_APPLICATION)
+	}
+	var nid notifyIconData
+	nid.CbSize = uint32(unsafe.Sizeof(nid))
+	nid.HWnd = hwndMain
+	nid.UID = 1
+	nid.UFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+	nid.UCallbackMessage = WM_TRAYICON
+	nid.HIcon = icon
+	tip, _ := syscall.UTF16FromString("OpenCode Go Usage")
+	copy(nid.SzTip[:], tip)
+	procShellNotifyIconW.Call(NIM_ADD, uintptr(unsafe.Pointer(&nid)))
+}
+func removeTrayIcon() {
+	var nid notifyIconData
+	nid.CbSize = uint32(unsafe.Sizeof(nid))
+	nid.HWnd = hwndMain
+	nid.UID = 1
+	procShellNotifyIconW.Call(NIM_DELETE, uintptr(unsafe.Pointer(&nid)))
+}
+
+func wndProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
+	switch message {
+	case WM_PAINT:
+		paint(hwnd)
+		return 0
+	case WM_NCHITTEST:
+		state.mu.RLock()
+		setup := state.setup || state.key == ""
+		state.mu.RUnlock()
+		if setup {
+			return HTCLIENT
+		}
