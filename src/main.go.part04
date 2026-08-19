@@ -1,0 +1,186 @@
+		return HTCAPTION
+	case WM_TIMER:
+		if wParam == 1 {
+			procInvalidateRect.Call(hwnd, 0, 0)
+		}
+		if wParam == 2 {
+			go fetchUsage()
+		}
+		return 0
+	case WM_DATAREADY:
+		procInvalidateRect.Call(hwnd, 0, 1)
+		return 0
+	case WM_SHOWSETUP:
+		state.mu.Lock()
+		state.setup = true
+		state.mu.Unlock()
+		updateSetupControls()
+		return 0
+	case WM_COMMAND:
+		id := int(loWord(wParam))
+		switch id {
+		case idSaveKey:
+			k := strings.TrimSpace(getText(hwndEdit))
+			if k == "" {
+				return 0
+			}
+			if err := saveKey(k); err != nil {
+				state.mu.Lock()
+				state.errText = "保存 Key 失败"
+				state.mu.Unlock()
+				procInvalidateRect.Call(hwnd, 0, 1)
+				return 0
+			}
+			state.mu.Lock()
+			state.key = k
+			state.setup = false
+			state.errText = ""
+			state.mu.Unlock()
+			updateSetupControls()
+			go fetchUsage()
+			return 0
+		case menuRefresh:
+			go fetchUsage()
+			return 0
+		case menuSetup:
+			procPostMessageW.Call(hwnd, WM_SHOWSETUP, 0, 0)
+			return 0
+		case menuTopmost:
+			state.mu.RLock()
+			on := !state.topmost
+			state.mu.RUnlock()
+			setTopmost(on)
+			return 0
+		case menuShow:
+			state.mu.Lock()
+			state.visible = !state.visible
+			visible := state.visible
+			state.mu.Unlock()
+			if visible {
+				procShowWindow.Call(hwnd, SW_SHOW)
+			} else {
+				procShowWindow.Call(hwnd, SW_HIDE)
+			}
+			return 0
+		case menuExit:
+			procPostMessageW.Call(hwnd, WM_CLOSE, 0, 0)
+			return 0
+		}
+	case WM_TRAYICON:
+		switch uint32(lParam) {
+		case WM_RBUTTONUP:
+			showTrayMenu()
+			return 0
+		case WM_LBUTTONDOWN:
+			state.mu.Lock()
+			state.visible = true
+			state.mu.Unlock()
+			procShowWindow.Call(hwnd, SW_SHOW)
+			procSetForegroundWindow.Call(hwnd)
+			return 0
+		}
+	case WM_CLOSE:
+		procKillTimer.Call(hwnd, 1)
+		procKillTimer.Call(hwnd, 2)
+		removeTrayIcon()
+		procPostQuitMessage.Call(0)
+		return 0
+	case WM_DESTROY:
+		procPostQuitMessage.Call(0)
+		return 0
+	}
+	r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(message), wParam, lParam)
+	return r
+}
+
+func makeFont(size int32, weight int32) uintptr {
+	hdc, _, _ := procGetDC.Call(0)
+	dpi, _, _ := procGetDeviceCaps.Call(hdc, LOGPIXELSY)
+	procReleaseDC.Call(0, hdc)
+	heightPx := -int32(int64(size) * int64(dpi) / 72)
+	f, _, _ := procCreateFontW.Call(uintptr(heightPx), 0, 0, 0, uintptr(weight), 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH|FF_DONTCARE, uintptr(unsafe.Pointer(utf16Ptr("Segoe UI"))))
+	return f
+}
+
+func initialPosition() (int32, int32) {
+	var wa rect
+	r, _, _ := procSystemParametersInfoW.Call(SPI_GETWORKAREA, 0, uintptr(unsafe.Pointer(&wa)), 0)
+	if r == 0 {
+		return 100, 100
+	}
+	return wa.Right - width - 18, wa.Bottom - height - 18
+}
+
+func main() {
+	runtime.LockOSThread()
+	procSetProcessDPIAware.Call()
+	hInstance, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
+	cursor, _, _ := procLoadCursorW.Call(0, IDC_ARROW)
+	hIconLarge = loadEmbeddedIcon(32)
+	hIconSmall = loadEmbeddedIcon(16)
+	if hIconLarge == 0 {
+		hIconLarge, _, _ = procLoadIconW.Call(0, IDI_APPLICATION)
+	}
+	if hIconSmall == 0 {
+		hIconSmall = hIconLarge
+	}
+	className := utf16Ptr(windowClass)
+	wc := wndClassEx{CbSize: uint32(unsafe.Sizeof(wndClassEx{})), LpfnWndProc: syscall.NewCallback(wndProc), HInstance: hInstance, HIcon: hIconLarge, HCursor: cursor, LpszClassName: className, HIconSm: hIconSmall}
+	if r, _, e := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc))); r == 0 {
+		panic(e)
+	}
+	x, y := initialPosition()
+	hwnd, _, e := procCreateWindowExW.Call(WS_EX_TOOLWINDOW|WS_EX_TOPMOST, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(utf16Ptr(appName))), WS_POPUP, uintptr(x), uintptr(y), width, height, 0, 0, hInstance, 0)
+	if hwnd == 0 {
+		panic(e)
+	}
+	hwndMain = hwnd
+	procSendMessageW.Call(hwnd, WM_SETICON, ICON_BIG, hIconLarge)
+	procSendMessageW.Call(hwnd, WM_SETICON, ICON_SMALL, hIconSmall)
+	// Rounded region works on Windows 10/11; DWM preference improves native Win11 corners.
+	rgn, _, _ := procCreateRoundRectRgn.Call(0, 0, width, height, 18, 18)
+	procSetWindowRgn.Call(hwnd, rgn, 1)
+	pref := uint32(DWMWCP_ROUND)
+	procDwmSetWindowAttribute.Call(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, uintptr(unsafe.Pointer(&pref)), unsafe.Sizeof(pref))
+
+	fontTitle = makeFont(15, FW_SEMIBOLD)
+	fontNormal = makeFont(10, FW_NORMAL)
+	fontSmall = makeFont(9, FW_NORMAL)
+	hwndEdit, _, _ = procCreateWindowExW.Call(0, uintptr(unsafe.Pointer(utf16Ptr("EDIT"))), 0, WS_CHILD|WS_BORDER|WS_TABSTOP|ES_PASSWORD|ES_AUTOHSCROLL, 16, 76, 230, 30, hwnd, idEditKey, hInstance, 0)
+	hwndSave, _, _ = procCreateWindowExW.Call(0, uintptr(unsafe.Pointer(utf16Ptr("BUTTON"))), uintptr(unsafe.Pointer(utf16Ptr("保存并查询"))), WS_CHILD|WS_TABSTOP|BS_DEFPUSHBUTTON, 254, 76, 72, 30, hwnd, idSaveKey, hInstance, 0)
+	procSendMessageW.Call(hwndEdit, EM_SETCUEBANNER, 0, uintptr(unsafe.Pointer(utf16Ptr("sk-opencode-..."))))
+
+	key := loadKey()
+	state.mu.Lock()
+	state.key = key
+	state.setup = (key == "")
+	state.mu.Unlock()
+	updateSetupControls()
+	addTrayIcon()
+	procSetTimer.Call(hwnd, 1, 1000, 0)
+	procSetTimer.Call(hwnd, 2, 30000, 0)
+	procShowWindow.Call(hwnd, SW_SHOWNORMAL)
+	procUpdateWindow.Call(hwnd)
+	if key != "" {
+		go fetchUsage()
+	}
+
+	var m msg
+	for {
+		r, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
+		if int32(r) <= 0 {
+			break
+		}
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
+		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
+	}
+	if fontTitle != 0 {
+		procDeleteObject.Call(fontTitle)
+	}
+	if fontNormal != 0 {
+		procDeleteObject.Call(fontNormal)
+	}
+	if fontSmall != 0 {
+		procDeleteObject.Call(fontSmall)
+	}
+}
