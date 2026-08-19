@@ -1,65 +1,6 @@
-		return HTCAPTION
-	case WM_TIMER:
-		if wParam == 1 {
-			procInvalidateRect.Call(hwnd, 0, 0)
-		}
-		if wParam == 2 {
-			go fetchUsage()
-		}
-		return 0
-	case WM_DATAREADY:
-		procInvalidateRect.Call(hwnd, 0, 1)
-		return 0
-	case WM_SHOWSETUP:
-		state.mu.Lock()
-		state.setup = true
-		state.mu.Unlock()
-		updateSetupControls()
-		return 0
-	case WM_COMMAND:
-		id := int(loWord(wParam))
-		switch id {
-		case idSaveKey:
-			k := strings.TrimSpace(getText(hwndEdit))
-			if k == "" {
-				return 0
-			}
-			if err := saveKey(k); err != nil {
-				state.mu.Lock()
-				state.errText = "保存 Key 失败"
-				state.mu.Unlock()
-				procInvalidateRect.Call(hwnd, 0, 1)
-				return 0
-			}
-			state.mu.Lock()
-			state.key = k
-			state.setup = false
-			state.errText = ""
-			state.mu.Unlock()
-			updateSetupControls()
-			go fetchUsage()
-			return 0
-		case menuRefresh:
-			go fetchUsage()
-			return 0
-		case menuSetup:
-			procPostMessageW.Call(hwnd, WM_SHOWSETUP, 0, 0)
-			return 0
-		case menuTopmost:
-			state.mu.RLock()
-			on := !state.topmost
-			state.mu.RUnlock()
-			setTopmost(on)
-			return 0
-		case menuShow:
-			state.mu.Lock()
-			state.visible = !state.visible
-			visible := state.visible
-			state.mu.Unlock()
-			if visible {
-				procShowWindow.Call(hwnd, SW_SHOW)
-			} else {
-				procShowWindow.Call(hwnd, SW_HIDE)
+				if hwndPin != 0 {
+					procShowWindow.Call(hwndPin, SW_HIDE)
+				}
 			}
 			return 0
 		case menuExit:
@@ -83,6 +24,9 @@
 		procKillTimer.Call(hwnd, 1)
 		procKillTimer.Call(hwnd, 2)
 		removeTrayIcon()
+		if hwndPin != 0 {
+			procShowWindow.Call(hwndPin, SW_HIDE)
+		}
 		procPostQuitMessage.Call(0)
 		return 0
 	case WM_DESTROY:
@@ -130,11 +74,14 @@ func main() {
 		panic(e)
 	}
 	x, y := initialPosition()
-	hwnd, _, e := procCreateWindowExW.Call(WS_EX_TOOLWINDOW|WS_EX_TOPMOST, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(utf16Ptr(appName))), WS_POPUP, uintptr(x), uintptr(y), width, height, 0, 0, hInstance, 0)
+	hwnd, _, e := procCreateWindowExW.Call(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_LAYERED, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(utf16Ptr(appName))), WS_POPUP, uintptr(x), uintptr(y), width, height, 0, 0, hInstance, 0)
 	if hwnd == 0 {
 		panic(e)
 	}
 	hwndMain = hwnd
+	setOpacity(255)
+	// Separate unlock control remains clickable while the main overlay is WS_EX_TRANSPARENT.
+	hwndPin, _, _ = procCreateWindowExW.Call(WS_EX_TOOLWINDOW|WS_EX_TOPMOST, uintptr(unsafe.Pointer(utf16Ptr("BUTTON"))), uintptr(unsafe.Pointer(utf16Ptr("🔓"))), WS_POPUP|WS_TABSTOP, 0, 0, 28, 28, hwnd, idUnlock, hInstance, 0)
 	procSendMessageW.Call(hwnd, WM_SETICON, ICON_BIG, hIconLarge)
 	procSendMessageW.Call(hwnd, WM_SETICON, ICON_SMALL, hIconSmall)
 	// Rounded region works on Windows 10/11; DWM preference improves native Win11 corners.
