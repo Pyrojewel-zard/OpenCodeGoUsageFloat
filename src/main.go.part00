@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	_ "embed"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -37,11 +38,13 @@ const (
 	WM_NCHITTEST                   = 0x0084
 	WM_SETICON                     = 0x0080
 	WM_LBUTTONDOWN                 = 0x0201
+	WM_LBUTTONUP                   = 0x0202
 	WM_RBUTTONUP                   = 0x0205
 	WM_APP                         = 0x8000
 	WM_TRAYICON                    = WM_APP + 1
 	WM_DATAREADY                   = WM_APP + 2
 	WM_SHOWSETUP                   = WM_APP + 3
+	HTTRANSPARENT                  = ^uintptr(0) // -1
 	HTCAPTION                      = 2
 	HTCLIENT                       = 1
 	SW_HIDE                        = 0
@@ -58,6 +61,9 @@ const (
 	WS_EX_TOOLWINDOW               = 0x00000080
 	WS_EX_TOPMOST                  = 0x00000008
 	WS_EX_LAYERED                  = 0x00080000
+	WS_EX_TRANSPARENT              = 0x00000020
+	GWL_EXSTYLE                    = -20
+	LWA_ALPHA                      = 0x00000002
 	SWP_NOMOVE                     = 0x0002
 	SWP_NOSIZE                     = 0x0001
 	HWND_TOPMOST                   = ^uintptr(0) // -1
@@ -101,13 +107,20 @@ const (
 	SPI_GETWORKAREA                = 0x0030
 	EM_SETCUEBANNER                = 0x1501
 
-	idEditKey   = 1001
-	idSaveKey   = 1002
-	menuRefresh = 2001
-	menuSetup   = 2002
-	menuTopmost = 2003
-	menuShow    = 2004
-	menuExit    = 2005
+	idEditKey      = 1001
+	idSaveKey      = 1002
+	idUnlock       = 1003
+	menuRefresh    = 2001
+	menuSetup      = 2002
+	menuTopmost    = 2003
+	menuShow       = 2004
+	menuExit       = 2005
+	menuTheme      = 2006
+	menuPin        = 2007
+	menuOpacity100 = 2010
+	menuOpacity85  = 2011
+	menuOpacity70  = 2012
+	menuOpacity55  = 2013
 )
 
 var (
@@ -118,70 +131,46 @@ var (
 	crypt32  = syscall.NewLazyDLL("crypt32.dll")
 	dwmapi   = syscall.NewLazyDLL("dwmapi.dll")
 
-	procRegisterClassExW         = user32.NewProc("RegisterClassExW")
-	procCreateWindowExW          = user32.NewProc("CreateWindowExW")
-	procDefWindowProcW           = user32.NewProc("DefWindowProcW")
-	procShowWindow               = user32.NewProc("ShowWindow")
-	procUpdateWindow             = user32.NewProc("UpdateWindow")
-	procGetMessageW              = user32.NewProc("GetMessageW")
-	procTranslateMessage         = user32.NewProc("TranslateMessage")
-	procDispatchMessageW         = user32.NewProc("DispatchMessageW")
-	procPostQuitMessage          = user32.NewProc("PostQuitMessage")
-	procBeginPaint               = user32.NewProc("BeginPaint")
-	procEndPaint                 = user32.NewProc("EndPaint")
-	procGetClientRect            = user32.NewProc("GetClientRect")
-	procInvalidateRect           = user32.NewProc("InvalidateRect")
-	procSetTimer                 = user32.NewProc("SetTimer")
-	procKillTimer                = user32.NewProc("KillTimer")
-	procPostMessageW             = user32.NewProc("PostMessageW")
-	procSetWindowTextW           = user32.NewProc("SetWindowTextW")
-	procGetWindowTextLengthW     = user32.NewProc("GetWindowTextLengthW")
-	procGetWindowTextW           = user32.NewProc("GetWindowTextW")
-	procEnableWindow             = user32.NewProc("EnableWindow")
-	procSetFocus                 = user32.NewProc("SetFocus")
-	procSetWindowPos             = user32.NewProc("SetWindowPos")
-	procGetCursorPos             = user32.NewProc("GetCursorPos")
-	procCreatePopupMenu          = user32.NewProc("CreatePopupMenu")
-	procAppendMenuW              = user32.NewProc("AppendMenuW")
-	procTrackPopupMenu           = user32.NewProc("TrackPopupMenu")
-	procDestroyMenu              = user32.NewProc("DestroyMenu")
-	procSetForegroundWindow      = user32.NewProc("SetForegroundWindow")
-	procLoadCursorW              = user32.NewProc("LoadCursorW")
-	procLoadIconW                = user32.NewProc("LoadIconW")
-	procCreateIconFromResourceEx = user32.NewProc("CreateIconFromResourceEx")
-	procSystemParametersInfoW    = user32.NewProc("SystemParametersInfoW")
-	procCreateRoundRectRgn       = gdi32.NewProc("CreateRoundRectRgn")
-	procSetWindowRgn             = user32.NewProc("SetWindowRgn")
-	procSetBkMode                = gdi32.NewProc("SetBkMode")
-	procSetTextColor             = gdi32.NewProc("SetTextColor")
-	procCreateSolidBrush         = gdi32.NewProc("CreateSolidBrush")
-	procFillRect                 = user32.NewProc("FillRect")
-	procDeleteObject             = gdi32.NewProc("DeleteObject")
-	procCreatePen                = gdi32.NewProc("CreatePen")
-	procSelectObject             = gdi32.NewProc("SelectObject")
-	procMoveToEx                 = gdi32.NewProc("MoveToEx")
-	procLineTo                   = gdi32.NewProc("LineTo")
-	procCreateFontW              = gdi32.NewProc("CreateFontW")
-	procDrawTextW                = user32.NewProc("DrawTextW")
-	procGetDeviceCaps            = gdi32.NewProc("GetDeviceCaps")
-	procGetDC                    = user32.NewProc("GetDC")
-	procReleaseDC                = user32.NewProc("ReleaseDC")
-	procShellNotifyIconW         = shell32.NewProc("Shell_NotifyIconW")
-	procCryptProtectData         = crypt32.NewProc("CryptProtectData")
-	procCryptUnprotectData       = crypt32.NewProc("CryptUnprotectData")
-	procLocalFree                = kernel32.NewProc("LocalFree")
-	procDwmSetWindowAttribute    = dwmapi.NewProc("DwmSetWindowAttribute")
-	procSendMessageW             = user32.NewProc("SendMessageW")
-	procSetProcessDPIAware       = user32.NewProc("SetProcessDPIAware")
-)
-
-type point struct{ X, Y int32 }
-type rect struct{ Left, Top, Right, Bottom int32 }
-type msg struct {
-	Hwnd           uintptr
-	Message        uint32
-	WParam, LParam uintptr
-	Time           uint32
-	Pt             point
-	LPrivate       uint32
-}
+	procRegisterClassExW           = user32.NewProc("RegisterClassExW")
+	procCreateWindowExW            = user32.NewProc("CreateWindowExW")
+	procDefWindowProcW             = user32.NewProc("DefWindowProcW")
+	procShowWindow                 = user32.NewProc("ShowWindow")
+	procUpdateWindow               = user32.NewProc("UpdateWindow")
+	procGetMessageW                = user32.NewProc("GetMessageW")
+	procTranslateMessage           = user32.NewProc("TranslateMessage")
+	procDispatchMessageW           = user32.NewProc("DispatchMessageW")
+	procPostQuitMessage            = user32.NewProc("PostQuitMessage")
+	procBeginPaint                 = user32.NewProc("BeginPaint")
+	procEndPaint                   = user32.NewProc("EndPaint")
+	procGetClientRect              = user32.NewProc("GetClientRect")
+	procInvalidateRect             = user32.NewProc("InvalidateRect")
+	procSetTimer                   = user32.NewProc("SetTimer")
+	procKillTimer                  = user32.NewProc("KillTimer")
+	procPostMessageW               = user32.NewProc("PostMessageW")
+	procSetWindowTextW             = user32.NewProc("SetWindowTextW")
+	procGetWindowTextLengthW       = user32.NewProc("GetWindowTextLengthW")
+	procGetWindowTextW             = user32.NewProc("GetWindowTextW")
+	procEnableWindow               = user32.NewProc("EnableWindow")
+	procSetFocus                   = user32.NewProc("SetFocus")
+	procSetWindowPos               = user32.NewProc("SetWindowPos")
+	procGetWindowRect              = user32.NewProc("GetWindowRect")
+	procGetWindowLongPtrW          = user32.NewProc("GetWindowLongPtrW")
+	procSetWindowLongPtrW          = user32.NewProc("SetWindowLongPtrW")
+	procSetLayeredWindowAttributes = user32.NewProc("SetLayeredWindowAttributes")
+	procScreenToClient             = user32.NewProc("ScreenToClient")
+	procGetCursorPos               = user32.NewProc("GetCursorPos")
+	procCreatePopupMenu            = user32.NewProc("CreatePopupMenu")
+	procAppendMenuW                = user32.NewProc("AppendMenuW")
+	procTrackPopupMenu             = user32.NewProc("TrackPopupMenu")
+	procDestroyMenu                = user32.NewProc("DestroyMenu")
+	procSetForegroundWindow        = user32.NewProc("SetForegroundWindow")
+	procLoadCursorW                = user32.NewProc("LoadCursorW")
+	procLoadIconW                  = user32.NewProc("LoadIconW")
+	procCreateIconFromResourceEx   = user32.NewProc("CreateIconFromResourceEx")
+	procSystemParametersInfoW      = user32.NewProc("SystemParametersInfoW")
+	procCreateRoundRectRgn         = gdi32.NewProc("CreateRoundRectRgn")
+	procSetWindowRgn               = user32.NewProc("SetWindowRgn")
+	procSetBkMode                  = gdi32.NewProc("SetBkMode")
+	procSetTextColor               = gdi32.NewProc("SetTextColor")
+	procCreateSolidBrush           = gdi32.NewProc("CreateSolidBrush")
+	procFillRect                   = user32.NewProc("FillRect")
