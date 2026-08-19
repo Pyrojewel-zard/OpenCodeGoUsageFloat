@@ -1,0 +1,188 @@
+type paintStruct struct {
+	Hdc       uintptr
+	Erase     int32
+	RcPaint   rect
+	Restore   int32
+	IncUpdate int32
+	Reserved  [32]byte
+}
+type wndClassEx struct {
+	CbSize        uint32
+	Style         uint32
+	LpfnWndProc   uintptr
+	CbClsExtra    int32
+	CbWndExtra    int32
+	HInstance     uintptr
+	HIcon         uintptr
+	HCursor       uintptr
+	HbrBackground uintptr
+	LpszMenuName  *uint16
+	LpszClassName *uint16
+	HIconSm       uintptr
+}
+type notifyIconData struct {
+	CbSize            uint32
+	HWnd              uintptr
+	UID               uint32
+	UFlags            uint32
+	UCallbackMessage  uint32
+	HIcon             uintptr
+	SzTip             [128]uint16
+	DwState           uint32
+	DwStateMask       uint32
+	SzInfo            [256]uint16
+	UTimeoutOrVersion uint32
+	SzInfoTitle       [64]uint16
+	DwInfoFlags       uint32
+	GuidItem          [16]byte
+	HBalloonIcon      uintptr
+}
+type dataBlob struct {
+	CbData uint32
+	PbData *byte
+}
+
+type quotaWindow struct {
+	Status   string  `json:"status"`
+	Percent  float64 `json:"percent"`
+	ResetsAt string  `json:"resetsAt"`
+}
+type usagePayload struct {
+	Rolling *quotaWindow `json:"rolling"`
+	Weekly  *quotaWindow `json:"weekly"`
+	Monthly *quotaWindow `json:"monthly"`
+}
+type apiEnvelope struct {
+	Usage   *usagePayload `json:"usage"`
+	Rolling *quotaWindow  `json:"rolling"`
+	Weekly  *quotaWindow  `json:"weekly"`
+	Monthly *quotaWindow  `json:"monthly"`
+}
+type appState struct {
+	mu        sync.RWMutex
+	key       string
+	setup     bool
+	loading   bool
+	topmost   bool
+	visible   bool
+	stale     bool
+	errText   string
+	usage     usagePayload
+	fetchedAt time.Time
+}
+
+// app.ico is compiled directly into the executable. No external icon file is needed at runtime.
+//
+//go:embed app.ico
+var appIconICO []byte
+
+var (
+	hIconLarge uintptr
+	hIconSmall uintptr
+	state      = &appState{topmost: true, visible: true}
+	hwndMain   uintptr
+	hwndEdit   uintptr
+	hwndSave   uintptr
+	fetching   atomic.Bool
+	httpClient = &http.Client{Timeout: 15 * time.Second}
+	fontTitle  uintptr
+	fontNormal uintptr
+	fontSmall  uintptr
+)
+
+func utf16Ptr(s string) *uint16 { p, _ := syscall.UTF16PtrFromString(s); return p }
+func loWord(v uintptr) uint16   { return uint16(v & 0xffff) }
+func rgb(r, g, b byte) uintptr  { return uintptr(uint32(r) | uint32(g)<<8 | uint32(b)<<16) }
+
+func configPath() (string, error) {
+	base := os.Getenv("APPDATA")
+	if base == "" {
+		return "", errors.New("APPDATA not found")
+	}
+	dir := filepath.Join(base, "OpenCodeGoUsage")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "key.dat"), nil
+}
+
+func entropyBlob() dataBlob {
+	sum := sha256.Sum256([]byte("OpenCodeGoUsageFloat/v1/local-key"))
+	return dataBlob{CbData: uint32(len(sum)), PbData: &sum[0]}
+}
+
+func protect(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	in := dataBlob{CbData: uint32(len(data)), PbData: &data[0]}
+	ent := entropyBlob()
+	var out dataBlob
+	r, _, e := procCryptProtectData.Call(uintptr(unsafe.Pointer(&in)), 0, uintptr(unsafe.Pointer(&ent)), 0, 0, 0x1, uintptr(unsafe.Pointer(&out)))
+	if r == 0 {
+		return nil, e
+	}
+	defer procLocalFree.Call(uintptr(unsafe.Pointer(out.PbData)))
+	return append([]byte(nil), unsafe.Slice(out.PbData, out.CbData)...), nil
+}
+
+func unprotect(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	in := dataBlob{CbData: uint32(len(data)), PbData: &data[0]}
+	ent := entropyBlob()
+	var out dataBlob
+	r, _, e := procCryptUnprotectData.Call(uintptr(unsafe.Pointer(&in)), 0, uintptr(unsafe.Pointer(&ent)), 0, 0, 0x1, uintptr(unsafe.Pointer(&out)))
+	if r == 0 {
+		return nil, e
+	}
+	defer procLocalFree.Call(uintptr(unsafe.Pointer(out.PbData)))
+	return append([]byte(nil), unsafe.Slice(out.PbData, out.CbData)...), nil
+}
+
+func saveKey(key string) error {
+	p, err := configPath()
+	if err != nil {
+		return err
+	}
+	enc, err := protect([]byte(key))
+	if err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	buf.WriteString("OCGU1")
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(enc)))
+	buf.Write(enc)
+	return os.WriteFile(p, buf.Bytes(), 0600)
+}
+
+func loadKey() string {
+	p, err := configPath()
+	if err != nil {
+		return ""
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil || len(raw) < 9 || string(raw[:5]) != "OCGU1" {
+		return ""
+	}
+	n := binary.LittleEndian.Uint32(raw[5:9])
+	if int(9+n) > len(raw) {
+		return ""
+	}
+	dec, err := unprotect(raw[9 : 9+n])
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(dec))
+}
+
+func getText(hwnd uintptr) string {
+	n, _, _ := procGetWindowTextLengthW.Call(hwnd)
+	if n == 0 {
+		return ""
+	}
+	buf := make([]uint16, n+1)
+	procGetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), n+1)
+	return syscall.UTF16ToString(buf)
+}
